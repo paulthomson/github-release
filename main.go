@@ -15,10 +15,11 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
+	"time"
 )
 
 var (
@@ -31,15 +32,24 @@ var (
 	debug   bool
 )
 
+type Asset struct {
+	Id    int    `json:"id"`
+	Name  string `json:"name"`
+	Label string `json:"label"`
+	State string `json:"state"`
+}
+
 // Release represents a Github Release.
 type Release struct {
-	UploadURL  string `json:"upload_url,omitempty"`
-	TagName    string `json:"tag_name"`
-	Branch     string `json:"target_commitish"`
-	Name       string `json:"name"`
-	Body       string `json:"body"`
-	Draft      bool   `json:"draft"`
-	Prerelease bool   `json:"prerelease"`
+	UploadURL  string  `json:"upload_url,omitempty"`
+	TagName    string  `json:"tag_name"`
+	Branch     string  `json:"target_commitish"`
+	Name       string  `json:"name"`
+	Body       string  `json:"body"`
+	Draft      bool    `json:"draft"`
+	Prerelease bool    `json:"prerelease"`
+	Id         int     `json:"id"`
+	Assets     []Asset `json:"assets,omitempty"`
 }
 
 var verFlag bool
@@ -157,31 +167,30 @@ Please refer to https://help.github.com/articles/creating-an-access-token-for-co
 	log.Println("Done")
 }
 
-func uploadFile(uploadURL, path string) {
+func uploadFile(uploadURL, path string) ([]byte, int, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		log.Printf("Error: %s\n", err.Error())
-		return
+		return nil, 0, err
 	}
 	defer file.Close()
 
 	size, err := fileSize(file)
 	if err != nil {
 		log.Printf("Error: %s\n", err.Error())
-		return
+		return nil, 0, err
 	}
 
 	filename := filepath.Base(file.Name())
 	log.Printf("Uploading %s...\n", filename)
-	body, err := doRequest("POST", uploadURL+"?name="+filename, "application/octet-stream", file, size)
-	if err != nil {
-		log.Printf("Error: %s\n", err.Error())
-	}
+	body, status, err := doRequest("POST", uploadURL+"?name="+filename, "application/octet-stream", file, size)
 
 	if debug {
 		log.Println("========= UPLOAD RESPONSE ===========")
 		log.Println(string(body[:]))
 	}
+
+	return body, status, err
 }
 
 // CreateRelease creates a Github Release, attaching the given files as release assets
@@ -198,8 +207,36 @@ func CreateRelease(tag, branch, desc string, filepaths []string) {
 	publishRelease(release, filepaths)
 }
 
+func deleteAssetByFilename(releaseTag string, filename string) error {
+	data, _, err := doRequest("GET", fmt.Sprintf("%s/releases/tags/%s", githubAPIEndpoint, releaseTag), "application/json", nil, int64(0))
+	if err != nil {
+		return err
+	}
+
+	var release Release
+	err = json.Unmarshal(data, &release)
+	if err != nil {
+		return err
+	}
+
+	var assertIndexToDelete = -1
+	for i := range release.Assets {
+		if release.Assets[i].Name == filename {
+			assertIndexToDelete = i
+			break
+		}
+	}
+
+	if assertIndexToDelete == -1 {
+		return fmt.Errorf("could not find asset %s to delete", filename)
+	}
+
+	_, _, err = doRequest("DELETE", fmt.Sprintf("%s/releases/assets/%d", githubAPIEndpoint, release.Assets[assertIndexToDelete].Id), "application/json", nil, int64(0))
+
+	return err
+}
+
 func publishRelease(release Release, filepaths []string) {
-	endpoint := fmt.Sprintf("%s/releases", githubAPIEndpoint)
 	releaseData, err := json.Marshal(release)
 	if err != nil {
 		log.Fatalln(err)
@@ -207,13 +244,12 @@ func publishRelease(release Release, filepaths []string) {
 
 	releaseBuffer := bytes.NewBuffer(releaseData)
 
-	data, err := doRequest("POST", endpoint, "application/json", releaseBuffer, int64(releaseBuffer.Len()))
+	data, _, err := doRequest("POST", fmt.Sprintf("%s/releases", githubAPIEndpoint), "application/json", releaseBuffer, int64(releaseBuffer.Len()))
 
-	if err != nil && data != nil {
+	if err != nil && bytes.Contains(data, []byte("already_exists")) {
 		log.Println(err)
-		log.Println("Trying again assuming release already exists.")
-		endpoint = fmt.Sprintf("%s/releases/tags/%s", githubAPIEndpoint, release.TagName)
-		data, err = doRequest("GET", endpoint, "application/json", nil, int64(0))
+		log.Println("Release already exists. Getting existing release info to attach assets.")
+		data, _, err = doRequest("GET", fmt.Sprintf("%s/releases/tags/%s", githubAPIEndpoint, release.TagName), "application/json", nil, int64(0))
 	}
 
 	if err != nil {
@@ -230,15 +266,44 @@ func publishRelease(release Release, filepaths []string) {
 	// So we need to remove the {?name} part
 	uploadURL := strings.Split(release.UploadURL, "{")[0]
 
-	var wg sync.WaitGroup
-	for i := range filepaths {
-		wg.Add(1)
-		func(index int) {
-			uploadFile(uploadURL, filepaths[index])
-			wg.Done()
-		}(i)
+	const retryLimit = 5
+	for _, file := range filepaths {
+
+		retryCount := 0
+		for {
+			if retryCount >= retryLimit {
+				log.Fatalf("Retry limit of %d reached.\n", retryLimit)
+			}
+			_, status, err := uploadFile(uploadURL, file)
+
+			if err != nil {
+				log.Printf("Failed to upload asset %s\n", file)
+				log.Printf("Error: %s\n", err)
+
+				if status >= 500 && status < 600 {
+
+					log.Printf("Attempting to delete asset %s before retrying upload.\n", file)
+					err = deleteAssetByFilename(release.TagName, path.Base(file))
+					if err != nil {
+						log.Printf("Failed to delete asset. Ignoring error: %s.\n", err)
+					} else {
+						log.Printf("Successfully deleted %s\n", file)
+					}
+
+					time.Sleep(time.Duration(retryCount*retryCount) * time.Second)
+					log.Println("Retrying.")
+					retryCount++
+					continue
+				}
+
+				// If one file fails (and it is not a 5xx error) then this is a fatal error
+				os.Exit(1)
+			}
+
+			break
+		}
+
 	}
-	wg.Wait()
 }
 
 func fileSize(file *os.File) (int64, error) {
@@ -250,10 +315,10 @@ func fileSize(file *os.File) (int64, error) {
 }
 
 // Sends HTTP request to Github API
-func doRequest(method, url, contentType string, reqBody io.Reader, bodySize int64) ([]byte, error) {
+func doRequest(method, url, contentType string, reqBody io.Reader, bodySize int64) ([]byte, int, error) {
 	req, err := http.NewRequest(method, url, reqBody)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	req.Header.Set("Authorization", fmt.Sprintf("token %s", githubToken))
@@ -282,19 +347,19 @@ func doRequest(method, url, contentType string, reqBody io.Reader, bodySize int6
 	}
 
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	defer resp.Body.Close()
 
 	respBody, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return respBody, fmt.Errorf("Github returned an error:\n Code: %s. \n Body: %s", resp.Status, respBody)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		return respBody, resp.StatusCode, fmt.Errorf("Github returned an error:\n Code: %s. \n Body: %s", resp.Status, respBody)
 	}
 
-	return respBody, nil
+	return respBody, resp.StatusCode, nil
 }
